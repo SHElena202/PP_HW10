@@ -6,7 +6,15 @@ import sys
 import glob
 import logging
 import collections
+from asyncio.subprocess import Process
+from itertools import islice
+from multiprocessing import JoinableQueue
 from optparse import OptionParser
+
+from anyio import Lock, key
+from faker.providers import address
+from numpy.array_api._array_object import Array
+
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
@@ -17,8 +25,11 @@ import memcache
 
 
 NORMAL_ERR_RATE = 0.01
-AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
-
+PACKEGE_SIZE = 500
+AppsInstalled = collections.namedtuple(
+    "AppsInstalled",
+    ["dev_type", "dev_id", "lat", "lon", "apps"],
+)
 
 def dot_rename(path):
     head, fn = os.path.split(path)
@@ -26,25 +37,30 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
+def insert_appsinstalled(app_type, memc_client, apps, dry_run=False):
+    package, log_package = {}, []
+    for appsinstalled in apps:
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+
         if dry_run:
-           logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+            log_package.append((key, ua))
         else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
+            packed = ua.SerializeToString()
+            package.update({key:packed})
+
+        if dry_run:
+            for key, ua in log_package:
+                logging.debug("%s - %s -> %s" % (app_type, key, str(ua).replace("\n", " ")))
+        else:
+            try:
+                return len(memc_client.set_multi(package))
+            except Exception as e:
+                logging.exception("Cannot write to memc %s: %s" % (app_type, e))
+                return len(apps)
 
 
 def parse_appsinstalled(line):
@@ -66,6 +82,75 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
+def process_file(io_queue, file_stats, device_memc, memc_clients, options, lock):
+    logging.basicConfig(filename=options.log,
+                        level=logging.INFO if not options.dry else logging.DEBUG,
+                        format='[%(astime)s] %(levelname).1s %(msg)s',
+                        datefmt='%Y.%m.%d %H:%M:%S')
+    while True:
+        package = io_queue.get()
+        errors, processed = 0, 0
+        apps = dict((app_type, []) for app_type in device_memc)
+
+        for line in package:
+            appsinstalled = parse_appsinstalled(line)
+
+            if not appsinstalled:
+                errors += 1
+                continue
+
+            if apps.get(appsinstalled.dev_type) is None:
+                errors += 1
+                continue
+
+            apps[appsinstalled.dev_type].append(appsinstalled)
+
+        for app_type, _apps in apps.items():
+            if not _apps:
+                continue
+            _errors = insert_appsinstalled(app_type, memc_clients[app_type], _apps, options.dry)
+            processed += len(_apps) - _errors
+            errors += _errors
+
+        with lock:
+            file_stats[0] += errors
+            file_stats[1] += processed
+
+        io_queue.task_done()
+
+def produce(io_queue, options, workers, file_stats):
+    for fn in sorted(glob.inglob(options.pattern)):
+        logging.info('Processing %s' % fn)
+        fd = gzip.open(fn, 'rt')
+
+        package = list(islice(fd, PACKEGE_SIZE))
+        while package:
+            io_queue.put(package)
+            package = list(islice(fd, PACKEGE_SIZE))
+
+        io_queue.join()
+
+        if not file_stats[1]:
+            file_stats[0], file_stats[1] = 0, 0
+            fd.close()
+            dot_rename(fn)
+            continue
+
+        err_rate = file_stats[0] / file_stats[1]
+        file_stats[0], file_stats[1] = 0, 0
+
+        if err_rate < NORMAL_ERR_RATE:
+            logging.info('Acceptable error rate (%s). Successfull load' % err_rate)
+        else:
+            logging.error('High error rate (%s > %s). Failed load' % (err_rate, NORMAL_ERR_RATE))
+        fd.close()
+        dot_rename()
+
+        for worker in workers:
+            worker.terminate()
+
+
+
 def main(options):
     device_memc = {
         "idfa": options.idfa,
@@ -73,6 +158,25 @@ def main(options):
         "adid": options.adid,
         "dvid": options.dvid,
     }
+
+    lock = Lock()
+    file_stats = Array(typecode_or_type='i', size_or_initializer=2)
+
+    memc_clients = dict((key, memcache.Client([address]))
+                        for key, address in device_memc.items())
+
+    io_queue = JoinableQueue()
+
+    workers = []
+    for i in range(options.workers):
+        p = Process(target=process_file, args=(io_queue, file_stats, device_memc, memc_clients, options,lock))
+        p.start()
+        workers.append(p)
+
+    produce(io_queue, options, workers,file_stats)
+
+
+'''
     for fn in glob.iglob(options.pattern):
         processed = errors = 0
         logging.info('Processing %s' % fn)
@@ -107,6 +211,7 @@ def main(options):
             logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
         fd.close()
         dot_rename(fn)
+'''
 
 
 def prototest():
